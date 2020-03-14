@@ -1,0 +1,120 @@
+#include <windows.h>
+#include <windowsx.h>
+#include "opencv.hpp" //opencv 的头文件
+#include <opencv2/core/core.hpp>  
+#include <opencv2/opencv.hpp>
+#include <opencv2/highgui/highgui.hpp>  
+#include <opencv2/imgproc/imgproc.hpp> 
+#include "stdafx.h"
+#include <vector>
+#include <stdlib.h> 
+#include <iostream> 
+#include <algorithm>
+#include <fstream>
+#include <assert.h>
+#include <iomanip>
+#include <onnxruntime_cxx_api.h>
+#include <cuda_provider_factory.h>
+#include <onnxruntime_c_api.h>
+#include <math.h>
+using namespace std;
+
+const int IMAGE_SHAPE = 512;
+std::array<float, 3> MEAN_PIXEL = { 123.7, 116.8, 103.9 };
+std::array<int, 5> BACKBONE_STRIDES = { 4, 8, 16, 32, 64 };
+std::array<float, 5> RPN_ANCHOR_SCALES = { 8 * 6, 16 * 6, 32 * 6, 64 * 6, 128 * 6 };
+std::array<float, 3> RPN_ANCHOR_RATIOS = { 0.5, 1.0, 2.0 };
+const int RPN_ANCHOR_STRIDE = 1;
+const int GPU_COUNT = 1;
+const int BATCH_SIZE = RPN_ANCHOR_STRIDE * GPU_COUNT ;
+std::vector<Ort::Value> ort_inputs;
+std::array<float, 14> input_meta_ = { 0, 512, 512, 3, 512, 512, 3, 0, 0, 512, 512, 1, 0, 0 };
+std::array<float, 1 * 512 * 512 * 3> input_images_{};
+std::array<float, 1 * 65472 * 4> input_anchors_{};
+std::vector<int64_t> anchors_dim = { 1, 65472, 4 };
+std::vector<int64_t> images_dim = { 1, 512, 512, 3 };
+std::vector<int64_t> metas_dim = { 1, 14 };
+Ort::Value anchors_input_tensor_{ nullptr };
+Ort::Value images_input_tensor_{ nullptr };
+Ort::Value metas_input_tensor_{ nullptr };
+
+int main(){
+
+	Ort::Env env(ORT_LOGGING_LEVEL_WARNING, "test");
+	Ort::SessionOptions session_options;
+	const wchar_t* model_path = L"D:\\onnxruntime-projects-master\\test_models\\my_mrcnn.onnx";
+	printf("Using Onnxruntime C++ API\n");
+	Ort::Session session(env, model_path, session_options);
+	auto allocator_info = Ort::MemoryInfo::CreateCpu(OrtArenaAllocator, OrtMemTypeDefault);
+
+	///////////////1.Prepare for the "input_image"//////////////////
+
+	cv::Mat img = cv::imread("D:\\Mask_RCNN-master\\images_4\\01019_img_28.jpg",cv::IMREAD_COLOR);
+	if (img.rows!= IMAGE_SHAPE && img.cols != IMAGE_SHAPE)
+	{
+		cout << "The input's shape is invalid!" << endl; // We only accept fixed size now.
+		return -1;
+	}
+	cv::Mat img_;
+	img.convertTo(img_, CV_32FC3);
+	for (int i = 0; i < IMAGE_SHAPE; i++) {
+				for (int j = 0; j < IMAGE_SHAPE; j++) {
+					img_.at<cv::Vec3f>(i, j)[0] -= MEAN_PIXEL[0];
+					img_.at<cv::Vec3f>(i, j)[1] -= MEAN_PIXEL[1];
+					img_.at<cv::Vec3f>(i, j)[2] -= MEAN_PIXEL[2];
+				}
+			}
+	float* image_output = input_images_.data();
+	fill(input_images_.begin(), input_images_.end(), 0.f);
+	for (int c = 0; c < IMAGE_SHAPE; c++) {
+		for (int i = 0; i < IMAGE_SHAPE; i++) {
+			for (int j = 0; j < 3; j++) {
+					image_output[c * IMAGE_SHAPE * 3 + i * 3 + j] = (img_.ptr<float>(c)[i * 3 + j]);//Transfer cv::Mat to std::array.
+			}
+		}
+	}
+	images_input_tensor_ = Ort::Value::CreateTensor<float>(allocator_info, input_images_.data(), input_images_.size(), images_dim.data(), images_dim.size());
+    //float** my = generate_anchors(48.0, 128, 4);
+
+	/////////////////2.Prepare for the "input_anchors"/////////////////
+
+	std::ifstream data("D:\\Mask_RCNN-master\\anchors.txt");
+	float* anchors_output = input_anchors_.data();
+	fill(input_anchors_.begin(), input_anchors_.end(), 0.f);
+	for (int c = 0; c < 1; c++) {
+				for (int i = 0;i < 65472;i++) {
+					for (int j = 0;j < 4;j++) {
+						data >> setprecision(20) >> anchors_output[c*65472*4 + i*4 + j]; //We load the matrix from TXT for the calculation process 
+						                                                                 //is too complex to be tranferred from Python.
+					}
+				}
+			}
+    anchors_input_tensor_ = Ort::Value::CreateTensor<float>(allocator_info, input_anchors_.data(), input_anchors_.size(), anchors_dim.data(), anchors_dim.size());
+	
+	/////////////////3.Prepare for the "input_image_meta"/////////////////
+
+	metas_input_tensor_ = Ort::Value::CreateTensor<float>(allocator_info, input_meta_.data(), input_meta_.size(), metas_dim.data(), metas_dim.size());
+	
+	/////////////////4.Prepare for the model Inputs & Outputs indications/////////////////
+
+	ort_inputs.push_back(std::move(images_input_tensor_));
+	ort_inputs.push_back(std::move(metas_input_tensor_));
+	ort_inputs.push_back(std::move(anchors_input_tensor_));
+
+	std::vector<const char*> input_names = { "input_image", "input_image_meta", "input_anchors" };
+	const char* const output_names[] = { "mrcnn_detection", "mrcnn_class", "mrcnn_bbox" , "mrcnn_mask", "ROI", "rpn_class", "rpn_bbox"};
+
+	double timeStart = (double)cv::getTickCount();
+	std::vector<Ort::Value> ort_outputs = session.Run(Ort::RunOptions{ nullptr }, input_names.data(),
+	ort_inputs.data(), ort_inputs.size(),
+	output_names, 7);
+	double nTime = ((double)cv::getTickCount() - timeStart) / cv::getTickFrequency();
+	cout << "running time ：" << nTime << "sec\n" << endl;
+	
+	/////////////////5.Get Outputs and check them/////////////////
+	auto type_info = ort_outputs[3].GetTensorTypeAndShapeInfo();
+	std::vector<int64_t> shape = type_info.GetShape();
+	float* output_data = ort_outputs[3].GetTensorMutableData<float>();
+	return 0;
+}
+
