@@ -1,0 +1,184 @@
+
+import numpy as np
+import onnxruntime
+import math
+import cv2
+from mrcnn import visualize
+
+
+IMAGE_MIN_DIM = 320
+IMAGE_MAX_DIM = 512
+MEAN_PIXEL = np.array([123.7, 116.8, 103.9])
+BACKBONE_STRIDES = [4, 8, 16, 32, 64]
+RPN_ANCHOR_SCALES = (8 * 6, 16 * 6, 32 * 6, 64 * 6, 128 * 6)
+RPN_ANCHOR_RATIOS = [0.5, 1, 2]
+RPN_ANCHOR_STRIDE = 1
+IMAGES_PER_GPU = 1
+GPU_COUNT = 1
+BATCH_SIZE = IMAGES_PER_GPU * GPU_COUNT
+class_names = ['BG', 'branch']
+
+
+def generate_anchors(scales, ratios, shape, feature_stride, anchor_stride):
+    
+    # Get all combinations of scales and ratios
+    # scales, ratios = np.meshgrid(np.array(scales), np.array(ratios))
+    # scales = scales.flatten()
+    # ratios = ratios.flatten()
+    scales = [scales,scales,scales]
+    # Enumerate heights and widths from scales and ratios
+    sq = np.sqrt(ratios)
+    heights = scales / np.sqrt(ratios)
+    widths = scales * np.sqrt(ratios)
+
+    # Enumerate shifts in feature space
+    shifts_y = np.arange(0, shape[0], anchor_stride) * feature_stride
+    shifts_x = np.arange(0, shape[1], anchor_stride) * feature_stride
+    shifts_x, shifts_y = np.meshgrid(shifts_x, shifts_y)
+
+    # Enumerate combinations of shifts, widths, and heights
+    box_widths, box_centers_x = np.meshgrid(widths, shifts_x)
+    box_heights, box_centers_y = np.meshgrid(heights, shifts_y)
+
+    # Reshape to get a list of (y, x) and a list of (h, w)
+    box_centers = np.stack(
+        [box_centers_y, box_centers_x], axis=2).reshape([-1, 2])
+    box_sizes = np.stack([box_heights, box_widths], axis=2).reshape([-1, 2])
+
+    # Convert to corner coordinates (y1, x1, y2, x2)
+    boxes = np.concatenate([box_centers - 0.5 * box_sizes,
+                            box_centers + 0.5 * box_sizes], axis=1)
+    return boxes
+
+def norm_boxes(boxes, shape):
+    h, w = shape
+    scale = np.array([h - 1, w - 1, h - 1, w - 1])
+    shift = np.array([0, 0, 1, 1])
+    return np.divide((boxes - shift), scale).astype(np.float32)
+def denorm_boxes(boxes, shape):
+    h, w = shape
+    scale = np.array([h - 1, w - 1, h - 1, w - 1])
+    shift = np.array([0, 0, 1, 1])
+    return np.around(np.multiply(boxes, scale) + shift).astype(np.int32)
+def unmold_mask(mask, bbox, image_shape):
+    threshold = 0.5
+    y1, x1, y2, x2 = bbox
+    mask = cv2.resize(mask, ( x2 - x1, y2 - y1))
+    mask = np.where(mask >= threshold, 1, 0).astype(np.bool)
+
+    # Put the mask in the right location.
+    full_mask = np.zeros(image_shape[:2], dtype=np.bool)
+    full_mask[y1:y2, x1:x2] = mask
+    return full_mask
+
+def unmold_detections(detections, mrcnn_mask, original_image_shape,
+                          image_shape, window):
+        # How many detections do we have?
+        # Detections array is padded with zeros. Find the first class_id == 0.
+        zero_ix = np.where(detections[:, 4] == 0)[0]
+        N = zero_ix[0] if zero_ix.shape[0] > 0 else detections.shape[0]
+
+        # Extract boxes, class_ids, scores, and class-specific masks
+        boxes = detections[:N, :4]
+        class_ids = detections[:N, 4].astype(np.int32)
+        scores = detections[:N, 5]
+        masks = mrcnn_mask[np.arange(N), :, :, class_ids]
+
+        # Translate normalized coordinates in the resized image to pixel
+        # coordinates in the original image before resizing
+        window = norm_boxes(window, image_shape[:2])
+        wy1, wx1, wy2, wx2 = window
+        shift = np.array([wy1, wx1, wy1, wx1])
+        wh = wy2 - wy1  # window height
+        ww = wx2 - wx1  # window width
+        scale = np.array([wh, ww, wh, ww])
+        # Convert boxes to normalized coordinates on the window
+        boxes = np.divide(boxes - shift, scale)
+        # Convert boxes to pixel coordinates on the original image
+        boxes = denorm_boxes(boxes, original_image_shape[:2])
+
+        # Filter out detections with zero area. Happens in early training when
+        # network weights are still random
+        exclude_ix = np.where(
+            (boxes[:, 2] - boxes[:, 0]) * (boxes[:, 3] - boxes[:, 1]) <= 0)[0]
+        if exclude_ix.shape[0] > 0:
+            boxes = np.delete(boxes, exclude_ix, axis=0)
+            class_ids = np.delete(class_ids, exclude_ix, axis=0)
+            scores = np.delete(scores, exclude_ix, axis=0)
+            masks = np.delete(masks, exclude_ix, axis=0)
+            N = class_ids.shape[0]
+
+        # Resize masks to original image size and set boundary threshold.
+        full_masks = []
+        for i in range(N):
+            # Convert neural network mask to full size mask
+            full_mask = unmold_mask(masks[i], boxes[i], original_image_shape)
+            full_masks.append(full_mask)
+        full_masks = np.stack(full_masks, axis=-1)\
+            if full_masks else np.empty(original_image_shape[:2] + (0,))
+
+        return boxes, class_ids, scores, full_masks
+
+if __name__ == '__main__':
+  filename = "D:\\Mask_RCNN-master\\images_4\\01019_img_28.jpg"
+  model_file_name = './my_mrcnn.onnx'
+  image2 = cv2.imread(filename)
+  b,g,r = cv2.split(image2)
+     # 以RGB的形式重新组合。
+  image3 = [cv2.merge([r,g,b])]
+  image = cv2.merge([r,g,b])
+  h, w = image.shape[:2]
+  window = [0, 0, h, w]
+  image = image.astype(np.float32)-MEAN_PIXEL
+  meta = np.array(
+        [0] +                  # size=1
+        list([h, w, 3]) +        # size=3
+        list([h, w, 3]) +           # size=3
+        list(window) +                # size=4 (y1, x1, y2, x2) in image cooredinates
+        [1] +                     # size=1
+        list(np.zeros([2]))       # size=num_classes
+    )
+  backbone_shapes = np.array(
+        [[int(math.ceil(image.shape[0] / stride)),
+            int(math.ceil(image.shape[1] / stride))]
+            for stride in BACKBONE_STRIDES])
+  anchor = []
+  for i in range(len(RPN_ANCHOR_SCALES)):
+        anchor.append(generate_anchors(RPN_ANCHOR_SCALES[i], RPN_ANCHOR_RATIOS, backbone_shapes[i],
+                                        BACKBONE_STRIDES[i], RPN_ANCHOR_STRIDE))
+  a = np.concatenate(anchor, axis=0)
+#   anchors = norm_boxes(a, [h,w])
+#   np.savetxt("anchors.txt",anchors)
+  anchors = np.loadtxt("anchors.txt",dtype = "float32")
+  anchors = np.broadcast_to(anchors, (BATCH_SIZE,) + anchors.shape)
+
+  images = [image]
+  metas = [meta]
+  windows = [window]
+  images = np.stack(images)
+  metas = np.stack(metas)
+  windows = np.stack(windows)
+
+  sess = onnxruntime.InferenceSession(model_file_name)
+  results = \
+        sess.run(None, {"input_image": images.astype(np.float32),
+                        "input_anchors": anchors,
+                        "input_image_meta": metas.astype(np.float32)})
+    
+
+  results_final = []
+
+  for i, image in enumerate(image3):
+        final_rois, final_class_ids, final_scores, final_masks = \
+            unmold_detections(results[0][i], results[3][i], # detections[i], mrcnn_mask[i]
+                                    image.shape, images[i].shape,
+                                    windows[i])
+        results_final.append({
+            "rois": final_rois,
+            "class_ids": final_class_ids,
+            "scores": final_scores,
+            "masks": final_masks,
+        })
+        r = results_final[i]
+        visualize.display_instances(image, 1,filename, r['rois'], r['masks'], r['class_ids'],
+                                    class_names, r['scores'])
