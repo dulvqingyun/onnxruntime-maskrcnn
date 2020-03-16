@@ -20,14 +20,15 @@
 using namespace std;
 
 const int IMAGE_SHAPE = 512;
+const int RPN_ANCHOR_STRIDE = 1;
+const int GPU_COUNT = 1;
+const int BATCH_SIZE = RPN_ANCHOR_STRIDE * GPU_COUNT ;
+const float THRESHOLD = 0.5;
+std::vector<Ort::Value> ort_inputs;
 std::array<float, 3> MEAN_PIXEL = { 123.7, 116.8, 103.9 };
 std::array<int, 5> BACKBONE_STRIDES = { 4, 8, 16, 32, 64 };
 std::array<float, 5> RPN_ANCHOR_SCALES = { 8 * 6, 16 * 6, 32 * 6, 64 * 6, 128 * 6 };
 std::array<float, 3> RPN_ANCHOR_RATIOS = { 0.5, 1.0, 2.0 };
-const int RPN_ANCHOR_STRIDE = 1;
-const int GPU_COUNT = 1;
-const int BATCH_SIZE = RPN_ANCHOR_STRIDE * GPU_COUNT ;
-std::vector<Ort::Value> ort_inputs;
 std::array<float, 14> input_meta_ = { 0, 512, 512, 3, 512, 512, 3, 0, 0, 512, 512, 1, 0, 0 };
 std::array<float, 1 * 512 * 512 * 3> input_images_{};
 std::array<float, 1 * 65472 * 4> input_anchors_{};
@@ -38,6 +39,192 @@ Ort::Value anchors_input_tensor_{ nullptr };
 Ort::Value images_input_tensor_{ nullptr };
 Ort::Value metas_input_tensor_{ nullptr };
 
+int** CreateINTgArray(int colcount, int rowcount) {
+	int** strMsg = new int * [colcount];
+	for (int i = 0; i < colcount; i++)
+	{
+		strMsg[i] = new int[rowcount];
+	}
+	return strMsg;
+}
+float** CreateFLOATgArray(int colcount, int rowcount) {
+	float** strMsg = new float* [colcount];
+	for (int i = 0; i < colcount; i++)
+	{
+		strMsg[i] = new float[rowcount];
+	}
+	return strMsg;
+}
+bool** CreateBOOLgArray(int colcount, int rowcount) {
+	bool** strMsg = new bool* [colcount];
+	for (int i = 0; i < colcount; i++)
+	{
+		strMsg[i] = new bool[rowcount];
+	}
+	return strMsg;
+}
+bool*** CreateBOOL3DMask(int dim_1, int dim_2, int dim_3) {
+	bool*** Mask = new bool** [dim_1];
+	for (int x = 0; x < dim_1; x++)
+	{
+		Mask[x] = new bool* [dim_2];
+		for (int y = 0; y < dim_2; y++)
+		{
+			Mask[x][y] = new bool[dim_3];
+		}
+	}
+	return Mask;
+}
+float*** CreateFLOAT3DMask(int dim_1, int dim_2, int dim_3) {
+	float*** Mask;
+	Mask = new float** [dim_1];
+	for (int x = 0; x < dim_1; x++)
+	{
+		Mask[x] = new float* [dim_2];
+		for (int y = 0; y < dim_2; y++)
+		{
+			Mask[x][y] = new float [dim_3];
+		}
+	}
+	return Mask;
+}
+int*** CreateINT3DMask(int dim_1, int dim_2, int dim_3) {
+	int*** Mask;
+	Mask = new int** [dim_1];
+	for (int x = 0; x < dim_1; x++)
+	{
+		Mask[x] = new int* [dim_2];
+		for (int y = 0; y < dim_2; y++)
+		{
+			Mask[x][y] = new int[dim_3];
+		}
+	}
+	return Mask;
+}
+float**** CreateFLOAT4DMask(int dim_1, int dim_2, int dim_3, int dim_4) {
+	float**** Mask;
+	Mask = new float*** [dim_1];
+	for (int x = 0; x < dim_1; x++)
+	{
+		Mask[x] = new float** [dim_2];
+		for (int y = 0; y < dim_2; y++)
+		{
+			Mask[x][y] = new float* [dim_3];
+			for (int z = 0; z < dim_3; z++) {
+				Mask[x][y][z] = new float[dim_4];
+			}
+		}
+	}
+	return Mask;
+}
+void DeleteINTArray(int size, int** pstr)
+{
+	for (int i = 0; i < size; i++)
+	{
+		delete[]  pstr[i];   // 要在指针前加[] ， 否则的话 只释放p[i]所指的第一个单元所占的空间
+	}
+}
+void DeleteFLOATArray(int size, float** pstr)
+{
+	for (int i = 0; i < size; i++)
+	{
+		delete[]  pstr[i];   
+	}
+}
+bool** unmold_mask(float** mask,int* bbox) {
+	int y1 = bbox[0];
+	int x1 = bbox[1];
+	int y2 = bbox[2];
+	int x2 = bbox[3];
+
+	cv::Mat mask_(28, 28, CV_32FC1);
+	for (int i = 0; i < 28; i++) {
+		for (int j = 0; j < 28; j++) {
+			mask_.at<float>(i,j) = mask[i][j];
+		}
+	}
+	cv::Mat mask_re;
+	cv::resize(mask_, mask_re, cv::Size(x2 - x1, y2 - y1));
+	bool** mask_bool = CreateBOOLgArray(mask_re.size[0], mask_re.size[1]);
+	for (int i = 0; i < mask_re.size[0]; i++){
+		for (int j = 0; j < mask_re.size[1]; j++) {
+			if ((float)mask_re.at<float>(i , j) >= THRESHOLD) {
+				mask_bool[i][j] = TRUE;
+			}
+			else{ mask_bool[i][j] = FALSE; }
+		}
+	}
+	
+	bool** full_mask = CreateBOOLgArray(IMAGE_SHAPE, IMAGE_SHAPE);
+	for (int i = 0; i < IMAGE_SHAPE; i++) {
+		for (int j = 0; j < IMAGE_SHAPE; j++) {
+			full_mask[i][j] = FALSE;
+		}
+	}
+	for (int i = y1; i < y2; i++) {
+		for (int j = x1; j < x2; j++) {
+			full_mask[i][j] = mask_bool[i-y1][j-x1];
+		}
+	}
+	return full_mask;
+}
+bool*** unmold_detections(float detection[100][6], float**** mrcnn_mask) {
+	int N = 0;
+	for (int i = 0; i < 100; i++) {
+		if (detection[i][4] == 0) { N = i + 1; break; }
+	}
+	float** boxes = CreateFLOATgArray(N, 4);
+	for (int i = 0; i < N; i++){
+		for (int j = 0; j < 4; j++) {
+			boxes[i][j] = detection[i][j];
+		}
+	}
+	int** class_ids = CreateINTgArray(N, 1);
+	for (int i = 0; i < N; i++) {
+		class_ids[i][0] = floor(detection[i][4]);
+	}
+	float** scores = CreateFLOATgArray(N, 1);
+	for (int i = 0; i < N; i++) {
+		scores[i][0] = detection[i][5];
+	}
+	float*** masks = CreateFLOAT3DMask(N, 28, 28);
+		for (int i = 0; i < N; i++) {
+			int id = class_ids[i][0];
+			for (int j = 0; j < 28; j++) {
+				for (int k = 0; k < 28; k++) {
+					masks[i][j][k] = mrcnn_mask[i][j][k][id];
+				}
+			}
+		}
+	std::array<int, 4> scale = { 511,511,511,511 };
+	std::array<int, 4> shift = { 0,0,1,1 };
+	int** boxes_ = CreateINTgArray(N, 4);
+	for (int i = 0; i < N; i++) {
+		for (int j = 0; j < 4; j++) {
+			boxes_[i][j] = round(boxes[i][j] * scale[j] + shift[j]);
+		}
+	}
+	bool*** full_masks = CreateBOOL3DMask(N, IMAGE_SHAPE, IMAGE_SHAPE);
+	for (int i = 0; i < N; ++i) {
+		bool** mask_per = unmold_mask(masks[i], boxes_[i]);
+		for (int j = 0; j < IMAGE_SHAPE; j++) {
+			for (int k = 0; k < IMAGE_SHAPE; k++) {
+				full_masks[i][j][k] = mask_per[j][k];
+			}
+		}
+		delete[] mask_per;
+		mask_per = NULL;
+	}
+	return full_masks;
+}
+int GetObjectNumber(float detection[100][6]) {
+	int N = 0;
+	for (int i = 0; i < 100; i++) {
+		if (detection[i][4] == 0) { N = i + 1; break; }
+	}
+	cout << N << " objects detected." << endl;
+	return N;
+}
 int main(){
 
 	Ort::Env env(ORT_LOGGING_LEVEL_WARNING, "test");
@@ -84,7 +271,7 @@ int main(){
 	for (int c = 0; c < 1; c++) {
 				for (int i = 0;i < 65472;i++) {
 					for (int j = 0;j < 4;j++) {
-						data >> setprecision(20) >> anchors_output[c*65472*4 + i*4 + j]; //We load the matrix from TXT for the calculation process 
+						data >> setprecision(20) >> anchors_output[c*65472*4 + i*4 + j]; //We load the matrix from TXT for the calculation process of anchors
 						                                                                 //is too complex to be tranferred from Python.
 					}
 				}
@@ -112,9 +299,60 @@ int main(){
 	cout << "running time ：" << nTime << "sec\n" << endl;
 	
 	/////////////////5.Get Outputs and check them/////////////////
-	auto type_info = ort_outputs[3].GetTensorTypeAndShapeInfo();
+	auto type_info = ort_outputs[0].GetTensorTypeAndShapeInfo();
 	std::vector<int64_t> shape = type_info.GetShape();
-	float* output_data = ort_outputs[3].GetTensorMutableData<float>();
+	float detection[100][6];
+	float* detection_output_data = ort_outputs[0].GetTensorMutableData<float>();
+	float* mask_output_data = ort_outputs[3].GetTensorMutableData<float>();
+
+	for (int i = 0; i < 100; i++) {
+		for (int j = 0; j < 6; j++) {
+			detection[i][j] = detection_output_data[i * 6 + j];
+		}
+	}
+	float**** mrcnn_mask = CreateFLOAT4DMask(100, 28, 28, 2);
+	for (int i = 0; i < 100; i++) {
+		for (int j = 0; j < 28; j++) {
+			for (int k = 0; k < 28; k++) {
+				for (int l = 0; l < 2; l++) {
+					mrcnn_mask[i][j][k][l] = mask_output_data[i * 28 * 28 * 2 + j * 28 * 2 + k * 2 + l];
+				}
+			}
+		}
+	}
+	int N = GetObjectNumber(detection);
+	bool*** masks = unmold_detections(detection, mrcnn_mask);
+	int*** masks_ = CreateINT3DMask(N, 512, 512);
+	for (int i = 0; i < N; i++) {
+		for (int j = 0; j < 512; j++) {
+			for (int k = 0; k < 512; k++) {
+				masks_[i][j][k] = masks[i][j][k];
+			}
+		}
+	}
+	cv::Mat mask(512,512,CV_32FC1);
+	for (int i = 0; i < N; ++i) {
+
+		for (int l = 0; l < 512;l++) {
+			for (int c = 0; c < 512; c++) {
+				if (masks[i][l][c] == TRUE) {
+					cout << "oh" << endl;
+					mask.at<float>(l, c) = 255.0;
+				}
+				
+			}
+		}
+		cv::imwrite("D:\\Mask_RCNN-master\\my_mask.jpg", mask);
+		//cv::Mat final_mask;
+		//mask.convertTo(final_mask, CV_8UC1);
+		/*vector<vector<cv::Point>> contours;
+		vector<cv::Vec4i> hierarchy;
+		cv::findContours(final_mask, contours, hierarchy, cv::RETR_TREE, cv::CHAIN_APPROX_SIMPLE);
+		drawContours(img, contours, -1,cv::Scalar(255,255,255));*/
+	}
+	/*cv::namedWindow("dst", 0);
+	cv::imshow("dst", img);
+	cv::waitKey();*/
 	return 0;
 }
 
